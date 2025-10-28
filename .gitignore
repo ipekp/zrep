@@ -1,0 +1,12 @@
+*.swp
+.bash_history
+.bashrc
+.cache/
+.gitconfig
+.lesshst
+.profile
+.ssh/
+.viminfo
+.vimrc
+backups_metadata/
+snap/

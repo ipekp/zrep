@@ -1,0 +1,115 @@
+#!/bin/bash
+
+# GLOBAL SETTINGS
+
+ZSYNC_PREFIX="zsync"
+ZSYNC_SSHCONNECT_TIMEOUT=3
+ZSYNC_SSHPARAMS="-T -o BatchMode=yes -o ConnectTimeout=$ZSYNC_SSHCONNECT_TIMEOUT"
+
+
+# timestamp sur les snapshot car rename les modifie
+# egaliser les ZFS avant tout (sauf si c un init)
+# fonction qui egalise
+# opt refactor un peu (fonction send_init, fonction equalize, fonction rolling)
+
+usage() {
+  cat << HEREDOC
+Usage: $(basename "$0") srcfs desthost destfs
+Ex: $(basename "$0") tank 10.1.1.2 tank/backups
+
+Synchronize two ZFS pools from master FS to backup.
+Will create backup FS if it doesn't exists.
+
+HEREDOC
+}
+
+errquit(){
+  printf "Error %s\n" "$*"
+  exit 1
+}
+
+main() {
+  typeset srcfs desthost destfs
+
+  [[ $# != 3 ]] && errquit "$(usage)"
+
+  srcfs="$1"
+  desthost="$2"
+  destfs="$3"
+  
+  # starts here
+  zsync_verify $srcfs $desthost $destfs
+}
+
+# Sanity check to verify whether srcfs and dstfs are in sync
+zsync_verify() {
+  typeset srcfs desthost destfs localtime remotetime
+
+  srcfs="$1"
+  desthost="$2"
+  destfs="$3"
+
+  # reachability
+  msg=$(ssh $ZSYNC_SSHPARAM "root@$desthost" exit 2>&1)
+  if [[ $? -ne 0 ]]; then
+    errquit "Backup '$desthost' is not reachable: "$msg""
+  fi
+
+  # time sync
+  localtime=$(date +%s)
+  remotetime="$(ssh -o BatchMode=yes -o ConnectTimeout=$ZSYNC_SSHCONNECT_TIMEOUT "root@$desthost" "date +%s")"
+
+  if (( localtime - remotetime > 100))
+  then
+    errquit "Master and backup are more than 100sec out of time sync"
+  fi
+
+  printf "Local: %s - Remote: %s\n" "$localtime" "$remotetime"
+  exit 1
+  # check connectivity
+  # checks if time is synced between master and backup
+  # if local doesn't have prefix_0, we must do full replication to backup
+
+  #if [[ $(zfs list -t snapshot 2>&1 | grep -E '$prefix_0 ' | wc -l) == 0 ]]
+  #then
+  #fi
+  #echo "verification called"
+}
+
+# Perform snapshot and adds zsync:timestamp
+#zsync_snap() {
+#}
+
+main "${@}"
+exit 0
+
+# ======= prev
+
+keep=3
+
+prefix=$(date +%Y%m%d_%H%M%S) #la date de creation du snap est dessus
+prefix="bk"
+
+# si snap 0 n'existe pas c un init
+
+is_init=$(zfs list -t snapshot 2>&1 | grep -E '_0 ' | wc -l)
+if [[ $is_init == 0 ]]; then 
+    echo "sending init ..."
+    zfs snapshot tank@${prefix}_0
+    zfs send -R tank@${prefix}_0 | ssh -T bks2 zfs recv -F tank
+    exit 0
+fi
+
+# efface toujours la derniere
+echo "zfs destroy -r tank@${prefix}_$keep" 
+zfs destroy -r tank@${prefix}_$keep > /dev/null 2>&1
+# rename tout le reste +1
+for ((i=$keep-1; i>=0; i--)); do
+    echo "zfs rename tank@${prefix}_$i tank@${prefix}_$((i+1))"
+    zfs rename tank@${prefix}_$i tank@${prefix}_$((i+1)) > /dev/null 2>&1
+done
+# prend ton snap day 0 et envoie
+echo "zfs snapshot tank@${prefix}_0"
+zfs snapshot tank@${prefix}_0
+echo "zfs send -R -I tank@${prefix}_1 tank@${prefix}_0 | ssh -T bks2 zfs recv -F tank"
+zfs send -R -I tank@${prefix}_1 tank@${prefix}_0 | ssh -T bks2 zfs recv -F tank
