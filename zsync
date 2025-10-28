@@ -1,16 +1,19 @@
 #!/bin/bash
 
 # GLOBAL SETTINGS
-
-ZSYNC_PREFIX="zsync"
+ZSYNC_PREFIX="bk"
 ZSYNC_SSHCONNECT_TIMEOUT=3
 ZSYNC_SSHPARAMS="-T -o BatchMode=yes -o ConnectTimeout=$ZSYNC_SSHCONNECT_TIMEOUT"
-
-
-# timestamp sur les snapshot car rename les modifie
-# egaliser les ZFS avant tout (sauf si c un init)
-# fonction qui egalise
-# opt refactor un peu (fonction send_init, fonction equalize, fonction rolling)
+ZSYNC_RETENTION=3 # keep last 3
+## RETURN CODES
+ZSYNC_ERR_REACH=100
+ZSYNC_ERR_TIMESYNC=101
+ZSYNC_ERR_DEVIATION=102
+ZSYNC_DO_INIT=0
+ZSYNC_DO_ROLLING=1
+## LOGGING @TODO
+# TIMESTAMPS on snapshots bc rename changes the creation date
+# fonction qui egalise 
 
 usage() {
   cat << HEREDOC
@@ -39,46 +42,103 @@ main() {
   
   # starts here
   zsync_verify $srcfs $desthost $destfs
+  res=$?
+  case "$res" in
+    $ZSYNC_ERR_REACH)
+      errquit "Backup '$desthost' is not reachable: "$msg""
+    ;;
+    $ZSYNC_ERR_TIMESYNC)
+      errquit "Master ($localtime) and backup ($remotetime) are ${timediff}sec out of time sync"
+    ;;
+    $ZSYNC_ERR_DEVIATION)
+      errquit "Master and backup have different latest snapshot guid (DEVIATION)"
+    ;;
+    $ZSYNC_DO_INIT)
+      zsync_init $srcfs $desthost $destfs
+    ;;
+    $ZSYNC_DO_ROLLING)
+      zsync_roll $srcfs $desthost $destfs
+    ;;
+  esac
 }
 
-# Sanity check to verify whether srcfs and dstfs are in sync
+# Sanity checks to verify MASTER and BACKUP fs
 zsync_verify() {
-  typeset srcfs desthost destfs localtime remotetime
+  typeset srcfs desthost destfs localtime remotetime localguid remoteguid
 
   srcfs="$1"
   desthost="$2"
   destfs="$3"
 
   # reachability
-  msg=$(ssh $ZSYNC_SSHPARAM "root@$desthost" exit 2>&1)
+  msg=$(ssh $ZSYNC_SSHPARAMS "root@$desthost" exit 2>&1)
   if [[ $? -ne 0 ]]; then
-    errquit "Backup '$desthost' is not reachable: "$msg""
+    return $ZSYNC_ERR_REACH
   fi
 
   # time sync
   localtime=$(date +%s)
-  remotetime="$(ssh -o BatchMode=yes -o ConnectTimeout=$ZSYNC_SSHCONNECT_TIMEOUT "root@$desthost" "date +%s")"
+  remotetime="$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "date +%s")"
 
-  if (( localtime - remotetime > 100))
-  then
-    errquit "Master and backup are more than 100sec out of time sync"
+  timediff=$(( localtime - remotetime ))
+  timediff=$(( timediff < 0 ? -timediff : timediff ))
+
+  if [[ $timediff -gt 100 ]]; then
+    return $ZSYNC_ERR_TIMESYNC
   fi
 
-  printf "Local: %s - Remote: %s\n" "$localtime" "$remotetime"
-  exit 1
-  # check connectivity
-  # checks if time is synced between master and backup
-  # if local doesn't have prefix_0, we must do full replication to backup
 
-  #if [[ $(zfs list -t snapshot 2>&1 | grep -E '$prefix_0 ' | wc -l) == 0 ]]
-  #then
-  #fi
-  #echo "verification called"
+  # is an init ?
+  is_init=$(zfs list -r "$srcfs" -t snapshot 2>&1 | grep -E "${ZSYNC_PREFIX}_0 " | wc -l)
+  if [[ $is_init == 0 ]]; then
+    return $ZSYNC_DO_INIT
+  else
+    # latest guid are equal ?
+    localguid=$(zfs get -H guid ${srcfs}@${ZSYNC_PREFIX}_0 | awk '{print $3}')
+    remoteguid=$(ssh $ZSYNC_SSHPARAM "root@$desthost" zfs get -H guid ${destfs}@${ZSYNC_PREFIX}_0 | awk '{print $3}')
+    if [[ $localguid == $remoteguid ]]; then
+      return $ZSYNC_DO_ROLLING
+    else
+      # if not there's DEVIATION
+      return $ZSYNC_ERR_DEVIATION
+    fi
+  fi
+
+
+  exit 1
 }
 
-# Perform snapshot and adds zsync:timestamp
-#zsync_snap() {
-#}
+# Perform initial full send
+zsync_init() {
+  typeset srcfs desthost destfs
+  srcfs="$1"
+  desthost="$2"
+  destfs="$3"
+
+  echo "sending init ..."
+  zfs snapshot ${srcfs}@${prefix}_0
+  zfs send -R ${srcfs}@${prefix}_0 | ssh -T $desthost zfs recv -F $destfs
+}
+
+# Perform rolling snapshots from master to backup
+zsync_roll() {
+  typeset srcfs desthost destfs
+  srcfs="$1"
+  desthost="$2"
+  destfs="$3"
+
+  echo "doing rolling ... "
+  # always destroy snapshot that are above retention
+  zfs destroy -r ${srcfs}@${ZSYNC_PREFIX}_$ZSYNC_RETENTION > /dev/null 2>&1
+  # roll
+  for ((i=$ZSYNC_RETENTION-1; i>=0; i--)); do
+      zfs rename ${srcfs}@${ZSYNC_PREFIX}_$i ${srcfs}@${ZSYNC_PREFIX}_$((i+1)) > /dev/null 2>&1
+  done
+  # take new snap_0
+  zfs snapshot ${srcfs}@${ZSYNC_PREFIX}_0
+  # send the increment between now (0) and before (1)
+  zfs send -R -I ${srcfs}@${ZSYNC_PREFIX}_1 ${srcfs}@${ZSYNC_PREFIX}_0 | ssh -T $desthost zfs recv -F $destfs
+}
 
 main "${@}"
 exit 0
