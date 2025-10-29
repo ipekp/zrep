@@ -32,13 +32,8 @@ errquit(){
 # @TODO
 # TIMESTAMPS on snapshots bc rename changes the creation date
 # fonction qui egalise 
-# cas d egalisation
-# 1: master n'a pas reussi a envoyer son snap (connectivite) et est en avance [OK]
-# 2: master a ete snapshot et l'ordre avant _0 _1 _2 est devenu _1 _2 => fo corriger les 2
-# 3: master a pris zpool destroy, mais backup est toujours up => envoie full backup
-# 4: backup a pris zpool destroy, mais master est toujours up => envoie full master
-# fo aussi expliquer comment chercher dans les clones
-# fo aussi passer sur prox des que c potable
+# better to get latest:
+# zfs list -t snapshot -H -o guid | tail -1
 
 usage() {
   cat << HEREDOC
@@ -112,17 +107,18 @@ zsync_verify() {
   fi
 
   # is an init ?
-  debugprint "zfs list -r "$srcfs" -t snapshot 2>&1 | grep -E "${ZSYNC_PREFIX}_0 " | wc -l"
-  is_init=$(zfs list -r "$srcfs" -t snapshot 2>&1 | grep -E "${ZSYNC_PREFIX}_0 " | wc -l)
+  debugprint "zfs list -H -r "$srcfs" -t snapshot -o name 2>&1 | grep -E "${ZSYNC_PREFIX}_" | wc -l"
+  is_init=$(zfs list -H -r "$srcfs" -t snapshot -o name 2>&1 | grep -E "${ZSYNC_PREFIX}_" | wc -l)
+  debugprint "is_init: $is_init"
 
   if [[ $is_init == 0 ]]; then
     return $ZSYNC_DO_INIT
   else
     # latest guid are equal ?
-    debugprint "zfs get -H guid ${srcfs}@${ZSYNC_PREFIX}_0 | awk '{print $3}'"
-    debugprint "ssh $ZSYNC_SSHPARAM "root@$desthost" zfs get -H guid ${destfs}@${ZSYNC_PREFIX}_0 | awk '{print $3}'"
-    localguid=$(zfs get -H guid ${srcfs}@${ZSYNC_PREFIX}_0 | awk '{print $3}')
-    remoteguid=$(ssh $ZSYNC_SSHPARAM "root@$desthost" zfs get -H guid ${destfs}@${ZSYNC_PREFIX}_0 | awk '{print $3}')
+    debugprint "Checking if latest guids are equal"
+    localguid=$(zfs list -t snapshot -H -d 1 -o guid | tail -1)
+    remoteguid=$(ssh $ZSYNC_SSHPARAM "root@$desthost" zfs list -t snapshot -H -d 1 -o guid | tail -1)
+    debugprint "Local guid: $localguid - Remote guid: $remoteguid"
 
     if [[ $localguid == $remoteguid ]]; then
       return $ZSYNC_DO_ROLLING
@@ -133,6 +129,13 @@ zsync_verify() {
   fi
 }
 
+# cas d egalisation
+# 1: master n'a pas reussi a envoyer son snap (connectivite) et est en avance [OK]
+# 2: master a ete snapshot et l'ordre avant _0 _1 _2 est devenu _1 _2 => fo corriger les 2
+# 3: master a pris zpool destroy, mais backup est toujours up => envoie full backup
+# 4: backup a pris zpool destroy, mais master est toujours up => envoie full master
+# fo aussi expliquer comment chercher dans les clones
+# fo aussi passer sur prox des que c potable
 zsync_equalize(){
   typeset srcfs desthost destfs local_creation remote_creation localguid remoteguid
 
@@ -145,19 +148,23 @@ zsync_equalize(){
   # is there a snapshot 0 (none when we rolled back one or the other) ? @TODO
 
   # compare most recent snap_0 to find out which is late
-  local_creation=$(zfs get -H creation -o value ${srcfs}@${ZSYNC_PREFIX}_0)
+  local_creation=$(zfs list -t snapshot -H -d 1 -o creation | tail -1)
   local_creation=$(date -d "$local_creation" +%s)
-  remote_creation=$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs get -H creation -o value ${destfs}@${ZSYNC_PREFIX}_0")
+  remote_creation=$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -t snapshot -H -d 1 -o creation | tail -1")
   remote_creation=$(date -d "$remote_creation" +%s)
-  localguid=$(zfs get -H guid -o value ${srcfs}@${ZSYNC_PREFIX}_0)
-  remoteguid=$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs get -H guid -o value ${destfs}@${ZSYNC_PREFIX}_0")
+
+  localguid=$(zfs list -t snapshot -H -d 1 -o guid | tail -1)
+  remoteguid=$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -t snapshot -H -d 1 -o guid | tail -1")
+
+  echo "Local creation: $local_creation - Remote creation: $remote_creation"
+  echo "Local guid: $localguid - Remote guid: $remoteguid"
 
   if [[ $local_creation -gt $remote_creation ]]; then
     debugprint "Local ${srcfs}@${ZSYNC_PREFIX}_0($localguid) taken at $local_creation " \
       "is more recent than remote ${srcfs}@${ZSYNC_PREFIX}_0($remoteguid) taken at $remote_creation" 
 
     # find start and end snaps
-    start_snap=$(zfs list -H -t snapshot -o name,guid,creation | grep "$remoteguid" | awk '{print $1}')
+    start_snap=$(zfs list -H -t snapshot -d 1 -o name,guid,creation | grep "$remoteguid" | awk '{print $1}')
     end_snap=${srcfs}@${ZSYNC_PREFIX}_0
 
     # extra debug
@@ -166,16 +173,10 @@ zsync_equalize(){
     debugprint "$(printf '%.0s=' {1..18} && printf ' REMOTE SNAPS ' && printf '%.0s=' {1..18} ; echo)"
     debugprint "$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -H -t snapshot -o name,guid,creation")"
 
+    # seeing: cannot unmount '/tank/cold': unmount failed (zfs recv -M not supported on linux)
     printf "Will send the difference between $start_snap AND $end_snap to equalize\n"
-    debugprint "zfs send -R -I $start_snap $end_snap | ssh -T $desthost zfs recv -o readonly=on  -F $destfs"
-    #zfs send -R -I $start_snap $end_snap | ssh -T $desthost zfs recv -o readonly=on  -F $destfs
-
-    # would like to see this in debug
-    # root@BKS1:~# zfs list -t snapshot -o name,guid,creation
-    # NAME        GUID  CREATION
-    # tank@bk_1  18153469052398714126  Tue Oct 28 16:40 2025
-    # tank@bk_0  16789816784242719429  Tue Oct 28 16:41 2025
-
+    debugprint "zfs send -v -R -I $start_snap $end_snap | ssh -T $desthost zfs recv -o readonly=on -F -v $destfs"
+    zfs send -v -R -I $start_snap $end_snap | ssh -T $desthost zfs recv -o readonly=on -F -v $destfs
   fi
 
   exit 1
@@ -191,9 +192,9 @@ zsync_init() {
 
   printf "Performing full replication from local $srcfs to $desthost $destfs\n"
 
-  debugprint "zfs snapshot ${srcfs}@${ZSYNC_PREFIX}_0"
-  zfs snapshot ${srcfs}@${ZSYNC_PREFIX}_0
-  debugprint "zfs send -R -p ${srcfs}@${ZSYNC_PREFIX}_0 | ssh -T $desthost zfs recv -o readonly=on -F $destfs"
+  debugprint "zfs snapshot -r ${srcfs}@${ZSYNC_PREFIX}_0"
+  zfs snapshot -r ${srcfs}@${ZSYNC_PREFIX}_0
+  debugprint "zfs send -R ${srcfs}@${ZSYNC_PREFIX}_0 | ssh -T $desthost zfs recv -o readonly=on -F $destfs"
   zfs send -R ${srcfs}@${ZSYNC_PREFIX}_0 | ssh -T $desthost zfs recv -o readonly=on -F $destfs
 }
 
@@ -212,15 +213,15 @@ zsync_roll() {
 
   # roll
   for ((i=$ZSYNC_RETENTION-1; i>=0; i--)); do
-      debugprint "zfs rename ${srcfs}@${ZSYNC_PREFIX}_$i ${srcfs}@${ZSYNC_PREFIX}_$((i+1)) > /dev/null 2>&1"
-      zfs rename ${srcfs}@${ZSYNC_PREFIX}_$i ${srcfs}@${ZSYNC_PREFIX}_$((i+1)) > /dev/null 2>&1
+      debugprint "zfs rename -r ${srcfs}@${ZSYNC_PREFIX}_$i ${srcfs}@${ZSYNC_PREFIX}_$((i+1)) > /dev/null 2>&1"
+      zfs rename -r ${srcfs}@${ZSYNC_PREFIX}_$i ${srcfs}@${ZSYNC_PREFIX}_$((i+1)) > /dev/null 2>&1
   done
   # take new snap_0
-  debugprint "zfs snapshot ${srcfs}@${ZSYNC_PREFIX}_0"
-  zfs snapshot ${srcfs}@${ZSYNC_PREFIX}_0
+  debugprint "zfs snapshot -r ${srcfs}@${ZSYNC_PREFIX}_0"
+  zfs snapshot -r ${srcfs}@${ZSYNC_PREFIX}_0
   # send the increment between now (0) and before (1)
-  debugprint "zfs send -R -I ${srcfs}@${ZSYNC_PREFIX}_1 ${srcfs}@${ZSYNC_PREFIX}_0 | ssh -T $desthost zfs recv -o readonly=on  -F $destfs"
-  zfs send -R -I ${srcfs}@${ZSYNC_PREFIX}_1 ${srcfs}@${ZSYNC_PREFIX}_0 | ssh -T $desthost zfs recv -o readonly=on  -F $destfs
+  debugprint "zfs send -R -I ${srcfs}@${ZSYNC_PREFIX}_1 ${srcfs}@${ZSYNC_PREFIX}_0 | ssh -T $desthost zfs recv -o readonly=on -F $destfs"
+  zfs send -R -I ${srcfs}@${ZSYNC_PREFIX}_1 ${srcfs}@${ZSYNC_PREFIX}_0 | ssh -T $desthost zfs recv -o readonly=on -F $destfs
 }
 
 main "${@}"
