@@ -68,7 +68,6 @@ main() {
     ;;
     $ZSYNC_ERR_DEVIATION)
       zsync_equalize $srcfs $desthost $destfs
-      errquit "Master and backup have different latest snapshot guid (DEVIATION)"
     ;;
     $ZSYNC_DO_INIT)
       zsync_init $srcfs $desthost $destfs
@@ -147,7 +146,7 @@ zsync_equalize(){
 
   # is there a snapshot 0 (none when we rolled back one or the other) ? @TODO
 
-  # compare most recent snap_0 to find out which is late
+  # compare most recent snap_0 to find out which is late (latest guid are different)
   local_creation=$(zfs list -t snapshot -H -d 1 -o creation | tail -1)
   local_creation=$(date -d "$local_creation" +%s)
   remote_creation=$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -t snapshot -H -d 1 -o creation | tail -1")
@@ -156,12 +155,14 @@ zsync_equalize(){
   localguid=$(zfs list -t snapshot -H -d 1 -o guid | tail -1)
   remoteguid=$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -t snapshot -H -d 1 -o guid | tail -1")
 
-  echo "Local creation: $local_creation - Remote creation: $remote_creation"
-  echo "Local guid: $localguid - Remote guid: $remoteguid"
+  debugprint "Local creation: $local_creation - Remote creation: $remote_creation"
+  debugprint "Local guid: $localguid - Remote guid: $remoteguid"
 
   if [[ $local_creation -gt $remote_creation ]]; then
+    # happens when master couldn't send its snapshots to backup for w/e reason
+    # master would end up being in front
     debugprint "Local ${srcfs}@${ZSYNC_PREFIX}_0($localguid) taken at $local_creation " \
-      "is more recent than remote ${srcfs}@${ZSYNC_PREFIX}_0($remoteguid) taken at $remote_creation" 
+      "is MORE recent than remote ${srcfs}@${ZSYNC_PREFIX}_0($remoteguid) taken at $remote_creation" 
 
     # find start and end snaps
     start_snap=$(zfs list -H -t snapshot -d 1 -o name,guid,creation | grep "$remoteguid" | awk '{print $1}')
@@ -177,6 +178,35 @@ zsync_equalize(){
     printf "Will send the difference between $start_snap AND $end_snap to equalize\n"
     debugprint "zfs send -v -R -I $start_snap $end_snap | ssh -T $desthost zfs recv -o readonly=on -F -v $destfs"
     zfs send -v -R -I $start_snap $end_snap | ssh -T $desthost zfs recv -o readonly=on -F -v $destfs
+  else  
+    # happens when master rolled back, which makes him late compared to backup 
+    # master ex: zfs list -t snapshot -H -o name | grep bk_1 | xargs -I {} zfs rollback -Rrf {}
+    # but master is still reference and we should push the changes to backup
+    debugprint "Local ${srcfs}@${ZSYNC_PREFIX}_0($localguid) taken at $local_creation " \
+      "is LESS recent than remote ${srcfs}@${ZSYNC_PREFIX}_0($remoteguid) taken at $remote_creation" 
+
+    # extra debug
+    debugprint "$(printf '%.0s=' {1..18} && printf ' LOCAL SNAPS ' && printf '%.0s=' {1..19}; echo)"
+    debugprint "$(zfs list -H -t snapshot -o name,guid,creation)"
+    debugprint "$(printf '%.0s=' {1..18} && printf ' REMOTE SNAPS ' && printf '%.0s=' {1..18} ; echo)"
+    debugprint "$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -H -t snapshot -o name,guid,creation")"
+
+    # get remote name from latest local guid
+    debugprint "Remote guid: $remoteguid not equal to local guid: $localguid"
+    remotename=$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -t snapshot -H -d 1 -o name,guid | grep '$localguid'")
+    remotename=$(echo $remotename |  tr -s '\t' ' ' | tr -s ' ' | cut -d' ' -f1)
+    remotesnapname="$( echo $remotename | cut -d'@' -f2)"
+    debugprint "Remote name: $remotename - Remote snapname: $remotesnapname"
+    # destroy doesn't change the file system, must rollback
+    # rollback must be done on each elements (no recursion available)
+    debugprint "ssh $ZSYNC_SSHPARAMS "root@$desthost" 'zfs list -t snapshot -H -o name | grep "$remotesnapname"'"
+    rolls=$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -t snapshot -H -o name | grep $remotesnapname")
+    # xargs wouldn't work idk why ...
+    for r in $rolls; do
+      debugprint $r
+      debugprint "ssh $ZSYNC_SSHPARAMS "root@$desthost" 'zfs rollback -Rr $r'"
+      ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs rollback -Rr $r"
+    done
   fi
 
   exit 1
@@ -194,6 +224,7 @@ zsync_init() {
 
   debugprint "zfs snapshot -r ${srcfs}@${ZSYNC_PREFIX}_0"
   zfs snapshot -r ${srcfs}@${ZSYNC_PREFIX}_0
+  # @TODO missing SSH params
   debugprint "zfs send -R ${srcfs}@${ZSYNC_PREFIX}_0 | ssh -T $desthost zfs recv -o readonly=on -F $destfs"
   zfs send -R ${srcfs}@${ZSYNC_PREFIX}_0 | ssh -T $desthost zfs recv -o readonly=on -F $destfs
 }
