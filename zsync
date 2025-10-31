@@ -78,6 +78,7 @@ main() {
   esac
 }
 
+# Main function
 # Sanity checks to verify MASTER and BACKUP fs
 zsync_verify() {
   typeset srcfs desthost destfs localtime remotetime
@@ -174,10 +175,33 @@ zsync_equalize(){
     debugprint "$(printf '%.0s=' {1..18} && printf ' REMOTE SNAPS ' && printf '%.0s=' {1..18} ; echo)"
     debugprint "$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -H -t snapshot -o name,guid,creation")"
 
-    # seeing: cannot unmount '/tank/cold': unmount failed (zfs recv -M not supported on linux)
-    printf "Will send the difference between $start_snap AND $end_snap to equalize\n"
-    debugprint "zfs send -v -R -I $start_snap $end_snap | ssh -T $desthost zfs recv -o readonly=on -F -v $destfs"
-    zfs send -v -R -I $start_snap $end_snap | ssh -T $desthost zfs recv -o readonly=on -F -v $destfs
+    if [[ "$startsnap" != "" ]] ; then
+      # if start snap was found in master send incremental
+      # seeing: cannot unmount '/tank/cold': unmount failed (zfs recv -M not supported on linux)
+      printf "Will send the difference between $start_snap AND $end_snap to equalize\n"
+      debugprint "zfs send -v -R -I $start_snap $end_snap | ssh -T $desthost zfs recv -o readonly=on -F -v $destfs"
+      zfs send -v -R -I $start_snap $end_snap | ssh -T $desthost zfs recv -o readonly=on -F -v $destfs
+    else
+      # for w/e reason if remote latest isn't found in master then send full
+      printf "Anchor snap '$remoteguid' not in master, resetting snapshots ...\n"
+
+      debugprint "ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -t snapshot -H -d 1 -o name""
+      rolls=$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -t snapshot -H -d 1 -o name")
+      for r in $rolls; do
+        printf "Destroying remote snapshots"
+        debugprint "ssh $ZSYNC_SSHPARAMS "root@$desthost" 'zfs destroy -Rr $r'"
+        ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs destroy -Rr $r"
+      done
+
+      rolls=$(zfs list -t snapshot -H -d 1 -o name)
+      for r in $rolls; do
+        printf "Destroying local snapshots"
+        debugprint "zfs destroy -Rr $r"
+        zfs destroy -Rr $r
+      done
+      # calling init to resync clean
+      zsync_init $srcfs $desthost $destfs
+    fi
   else  
     # happens when master rolled back, which makes him late compared to backup 
     # master ex: zfs list -t snapshot -H -o name | grep bk_1 | xargs -I {} zfs rollback -Rrf {}
@@ -194,19 +218,43 @@ zsync_equalize(){
     # get remote name from latest local guid
     debugprint "Remote guid: $remoteguid not equal to local guid: $localguid"
     remotename=$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -t snapshot -H -d 1 -o name,guid | grep '$localguid'")
-    remotename=$(echo $remotename |  tr -s '\t' ' ' | tr -s ' ' | cut -d' ' -f1)
-    remotesnapname="$( echo $remotename | cut -d'@' -f2)"
-    debugprint "Remote name: $remotename - Remote snapname: $remotesnapname"
-    # destroy doesn't change the file system, must rollback
-    # rollback must be done on each elements (no recursion available)
-    debugprint "ssh $ZSYNC_SSHPARAMS "root@$desthost" 'zfs list -t snapshot -H -o name | grep "$remotesnapname"'"
-    rolls=$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -t snapshot -H -o name | grep $remotesnapname")
-    # xargs wouldn't work idk why ...
-    for r in $rolls; do
-      debugprint $r
-      debugprint "ssh $ZSYNC_SSHPARAMS "root@$desthost" 'zfs rollback -Rr $r'"
-      ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs rollback -Rr $r"
-    done
+
+    if [[ "$remotename" != "" ]] ; then
+      # if we found master anchor in backup
+      remotename=$(echo $remotename |  tr -s '\t' ' ' | tr -s ' ' | cut -d' ' -f1)
+      remotesnapname="$( echo $remotename | cut -d'@' -f2)"
+      debugprint "Remote name: $remotename - Remote snapname: $remotesnapname"
+      # destroy doesn't change the file system, must rollback
+      # rollback must be done on each elements (no recursion available)
+      debugprint "ssh $ZSYNC_SSHPARAMS "root@$desthost" 'zfs list -t snapshot -H -o name | grep "$remotesnapname"'"
+      rolls=$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -t snapshot -H -o name | grep $remotesnapname")
+      # then we just rollback backup
+      for r in $rolls; do
+        debugprint $r
+        debugprint "ssh $ZSYNC_SSHPARAMS "root@$desthost" 'zfs rollback -Rr $r'"
+        ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs rollback -Rr $r"
+      done
+    else
+      # if we cannot find master anchor in backup
+      printf "Anchor snap '$localguid' not found backup, resetting snapshots ...\n"
+
+      debugprint "ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -t snapshot -H -d 1 -o name""
+      rolls=$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -t snapshot -H -d 1 -o name")
+      for r in $rolls; do
+        printf "Destroying remote snapshots"
+        debugprint "ssh $ZSYNC_SSHPARAMS "root@$desthost" 'zfs destroy -Rr $r'"
+        ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs destroy -Rr $r"
+      done
+
+      rolls=$(zfs list -t snapshot -H -d 1 -o name)
+      for r in $rolls; do
+        printf "Destroying local snapshots"
+        debugprint "zfs destroy -Rr $r"
+        zfs destroy -Rr $r
+      done
+      # calling init to resync clean
+      zsync_init $srcfs $desthost $destfs
+    fi
   fi
 
   exit 1
@@ -250,7 +298,7 @@ zsync_roll() {
   # take new snap_0
   debugprint "zfs snapshot -r ${srcfs}@${ZSYNC_PREFIX}_0"
   zfs snapshot -r ${srcfs}@${ZSYNC_PREFIX}_0
-  # send the increment between now (0) and before (1)
+  # send the increment between now (0) and before (1) @TODO missing SSH_PARAMS
   debugprint "zfs send -R -I ${srcfs}@${ZSYNC_PREFIX}_1 ${srcfs}@${ZSYNC_PREFIX}_0 | ssh -T $desthost zfs recv -o readonly=on -F $destfs"
   zfs send -R -I ${srcfs}@${ZSYNC_PREFIX}_1 ${srcfs}@${ZSYNC_PREFIX}_0 | ssh -T $desthost zfs recv -o readonly=on -F $destfs
 }
