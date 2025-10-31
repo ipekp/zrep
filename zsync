@@ -221,24 +221,16 @@ zsync_equalize(){
       done
       # then we adjust snap_i by renaming them
       printf "Re-sequencing master and backup snapshots\n"
-      count=$(zfs list -t snapshot -d 1 -H -o name | wc -l)
-      echo "Count: $count"
-
       line=0
       snapshot_list=($(zfs list -t snapshot -d 1 -H -o name))
       count=${#snapshot_list[@]}
-
       for snapshot in "${snapshot_list[@]}"; do
           idx=$(($count - $line - 1))
-          echo "Line: $line Idx: $idx"
-          
           debugprint "zfs rename -r $snapshot $srcfs@${ZSYNC_PREFIX}_$idx"
           zfs rename -r "$snapshot" "$srcfs@${ZSYNC_PREFIX}_$idx"
 
           debugprint "ssh $ZSYNC_SSHPARAMS root@$desthost zfs rename -r $snapshot $destfs@${ZSYNC_PREFIX}_$idx"
           ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs rename -r $snapshot $destfs@${ZSYNC_PREFIX}_$idx"
-          echo "Exit code: $?"
-          
           line=$(($line + 1))
       done 
 
@@ -291,9 +283,8 @@ zsync_init() {
 
   debugprint "zfs snapshot -r ${srcfs}@${ZSYNC_PREFIX}_0"
   zfs snapshot -r ${srcfs}@${ZSYNC_PREFIX}_0
-  # @TODO missing SSH params
-  debugprint "zfs send -R ${srcfs}@${ZSYNC_PREFIX}_0 | ssh -T $desthost zfs recv -o readonly=on -F $destfs"
-  zfs send -R ${srcfs}@${ZSYNC_PREFIX}_0 | ssh -T $desthost zfs recv -o readonly=on -F $destfs
+  debugprint "zfs send -R ${srcfs}@${ZSYNC_PREFIX}_0 | ssh $ZSYNC_SSHPARAMS $desthost zfs recv -o readonly=on -F $destfs"
+  zfs send -R ${srcfs}@${ZSYNC_PREFIX}_0 | ssh $ZSYNC_SSHPARAMS $desthost zfs recv -o readonly=on -F $destfs
 }
 
 # Perform rolling snapshots from master to backup
@@ -317,7 +308,7 @@ zsync_roll() {
   # take new snap_0
   debugprint "zfs snapshot -r ${srcfs}@${ZSYNC_PREFIX}_0"
   zfs snapshot -r ${srcfs}@${ZSYNC_PREFIX}_0
-  # send the increment between now (0) and before (1) @TODO missing SSH_PARAMS
+  # send the increment between now (0) and before (1)
   debugprint "zfs send -R -I ${srcfs}@${ZSYNC_PREFIX}_1 ${srcfs}@${ZSYNC_PREFIX}_0 | ssh $ZSYNC_SSHPARAMS $desthost zfs recv -o readonly=on -F $destfs"
   zfs send -R -I ${srcfs}@${ZSYNC_PREFIX}_1 ${srcfs}@${ZSYNC_PREFIX}_0 | ssh $ZSYNC_SSHPARAMS $desthost zfs recv -o readonly=on -F $destfs
 }
