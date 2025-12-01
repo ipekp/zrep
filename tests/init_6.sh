@@ -8,9 +8,6 @@
 
 
 # destroy and rebuild backup
-
-
-
 ssh -T -o BatchMode=yes root@bks2 'zfs destroy -r -f tank'
 ssh -T -o BatchMode=yes root@bks2 'zpool destroy -f tank'
 ssh -T -o BatchMode=yes root@bks2 'zpool create -o ashift=12 tank /dev/vdb'
