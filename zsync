@@ -56,6 +56,14 @@ main() {
   desthost="$2"
   destfs="$3"
   
+  # backup latest VM config files to cold always
+  # these are in  /etc/pve/nodes/<node>/qemu-server/<vmid>.conf in proxmox
+  for path in 'lxc/' 'openvz/' 'qemu-server/'
+  do
+    mkdir -p /tank/cold/config/$path
+    find /etc/pve/nodes/$HOSTNAME/$path -type f | xargs -I {} cp {} /tank/cold/config/$path/
+  done
+
   # starts here
   zsync_verify $srcfs $desthost $destfs
   res=$?
