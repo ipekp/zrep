@@ -175,7 +175,7 @@ zsync_equalize(){
     debugprint "$(printf '%.0s=' {1..18} && printf ' REMOTE SNAPS ' && printf '%.0s=' {1..18} ; echo)"
     debugprint "$(ssh $ZSYNC_SSHPARAMS "root@$desthost" "zfs list -H -t snapshot -o name,guid,creation")"
 
-    if [[ "$startsnap" != "" ]] ; then
+    if [[ "$start_snap" != "" ]] ; then
       # if start snap was found in master send incremental
       # seeing: cannot unmount '/tank/cold': unmount failed (zfs recv -M not supported on linux)
       printf "Will send the difference between $start_snap AND $end_snap to equalize\n"
