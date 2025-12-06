@@ -38,11 +38,12 @@ errquit(){
 usage() {
   cat << HEREDOC
 Usage: $(basename "$0") srcfs desthost destfs
-Ex: $(basename "$0") tank 10.1.1.2 tank/backups
+Ex: $(basename "$0") tank host1 tank/backups
+OR
+Usage: $(basename "$0") srcfs desthost takeover
+Ex: $(basename "$0") tank host2 takeover
 
 Synchronize two ZFS pools from master FS to backup.
-Will create backup FS if it doesn't exists.
-
 HEREDOC
 }
 
@@ -50,6 +51,7 @@ HEREDOC
 main() {
   typeset srcfs desthost destfs
 
+  [[ $3 == "takeover" ]] && zsync_takeover $1 $2
   [[ $# != 3 ]] && errquit "$(usage)"
 
   srcfs="$1"
@@ -320,5 +322,23 @@ zsync_roll() {
   debugprint "zfs send -R -I ${srcfs}@${ZSYNC_PREFIX}_1 ${srcfs}@${ZSYNC_PREFIX}_0 | ssh $ZSYNC_SSHPARAMS $desthost zfs recv -o readonly=on -F $destfs"
   zfs send -R -I ${srcfs}@${ZSYNC_PREFIX}_1 ${srcfs}@${ZSYNC_PREFIX}_0 | ssh $ZSYNC_SSHPARAMS $desthost zfs recv -o readonly=on -F $destfs
 }
+
+# When backup takes over master
+# place VM config files in /etc/pve/nodes/<hostname>/
+# and remove the readonly property from zfs pools @TODO change static paths
+zsync_takeover() {
+  typeset srcfs desthost
+  srcfs="$1"
+  desthost="$2"
+  # vm files
+  for path in 'lxc/' 'openvz/' 'qemu-server/'
+  do
+    mkdir -p /etc/pve/nodes/$desthost/ 
+    cp -r /tank/cold/config/$path/ /etc/pve/nodes/$desthost/
+  done
+  zfs get all -r tank | grep readonly | awk '{print $1}' | xargs -I {} zfs set readonly=off {}
+  exit 0
+}
+
 
 main "${@}"
